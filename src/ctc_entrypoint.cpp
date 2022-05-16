@@ -5,10 +5,6 @@
 #include <ctc.h>
 
 #include "detail/cpu_ctc.h"
-#ifdef __CUDACC__
-    #include "detail/gpu_ctc.h"
-#endif
-
 
 extern "C" {
 
@@ -58,8 +54,7 @@ ctcStatus_t compute_ctc_loss(const float* const activations,
         return CTC_STATUS_INVALID_VALUE;
 
     if (options.loc == CTC_CPU) {
-        CpuCTC<float> ctc(alphabet_size, minibatch, workspace, options.num_threads,
-                          options.blank_label);
+        CpuCTC<float> ctc(alphabet_size, minibatch, workspace, options.num_threads);
 
         if (gradients != NULL)
             return ctc.cost_and_grad(activations, gradients,
@@ -69,22 +64,6 @@ ctcStatus_t compute_ctc_loss(const float* const activations,
         else
             return ctc.score_forward(activations, costs, flat_labels,
                                      label_lengths, input_lengths);
-    } else if (options.loc == CTC_GPU) {
-#ifdef __CUDACC__
-        GpuCTC<float> ctc(alphabet_size, minibatch, workspace, options.stream,
-                          options.blank_label);
-
-        if (gradients != NULL)
-            return ctc.cost_and_grad(activations, gradients, costs,
-                                     flat_labels, label_lengths,
-                                     input_lengths);
-        else
-            return ctc.score_forward(activations, costs, flat_labels,
-                                     label_lengths, input_lengths);
-#else
-        std::cerr << "GPU execution requested, but not compiled with GPU support" << std::endl;
-        return CTC_STATUS_EXECUTION_FAILED;
-#endif
     } else {
         return CTC_STATUS_INVALID_VALUE;
     }
@@ -108,67 +87,33 @@ ctcStatus_t get_workspace_size(const int* const label_lengths,
     int maxL = *std::max_element(label_lengths, label_lengths + minibatch);
     int maxT = *std::max_element(input_lengths, input_lengths + minibatch);
 
-    const int S = 2 * maxL + 1;
+    const int S = maxL;
 
     *size_bytes = 0;
 
-    if (options.loc == CTC_GPU) {
-        // GPU storage
-        //nll_forward, nll_backward
-        *size_bytes += 2 * sizeof(float) * minibatch;
+    //cpu can eventually replace all minibatch with
+    //max number of concurrent threads if memory is
+    //really tight
 
-        //repeats
-        *size_bytes += sizeof(int) * minibatch;
+    //per minibatch memory
+    size_t per_minibatch_bytes = 0;
 
-        //label offsets
-        *size_bytes += sizeof(int) * minibatch;
+    //output
+    per_minibatch_bytes += sizeof(float) * alphabet_size ;
 
-        //utt_length
-        *size_bytes += sizeof(int) * minibatch;
+    //alphas
+    per_minibatch_bytes += sizeof(float) * S * maxT;
 
-        //label lengths
-        *size_bytes += sizeof(int) * minibatch;
+    //betas
+    per_minibatch_bytes += sizeof(float) * S;
 
-        //labels without blanks - overallocate for now
-        *size_bytes += sizeof(int) * maxL * minibatch;
+    //labels w/blanks, e_inc, s_inc
+    per_minibatch_bytes += 1 * sizeof(int) * S;
 
-        //labels with blanks
-        *size_bytes += sizeof(int) * S * minibatch;
+    *size_bytes = per_minibatch_bytes * minibatch;
 
-        //alphas
-        *size_bytes += sizeof(float) * S * maxT * minibatch;
-
-        //denoms
-        *size_bytes += sizeof(float) * maxT * minibatch;
-
-        //probs (since we will pass in activations)
-        *size_bytes += sizeof(float) * alphabet_size * maxT * minibatch;
-
-    } else {
-        //cpu can eventually replace all minibatch with
-        //max number of concurrent threads if memory is
-        //really tight
-
-        //per minibatch memory
-        size_t per_minibatch_bytes = 0;
-
-        //output
-        per_minibatch_bytes += sizeof(float) * alphabet_size ;
-
-        //alphas
-        per_minibatch_bytes += sizeof(float) * S * maxT;
-
-        //betas
-        per_minibatch_bytes += sizeof(float) * S;
-
-        //labels w/blanks, e_inc, s_inc
-        per_minibatch_bytes += 3 * sizeof(int) * S;
-
-        *size_bytes = per_minibatch_bytes * minibatch;
-
-        //probs
-        *size_bytes += sizeof(float) * alphabet_size * maxT * minibatch;
-    }
+    //probs
+    *size_bytes += sizeof(float) * alphabet_size * maxT * minibatch;
 
     return CTC_STATUS_SUCCESS;
 }

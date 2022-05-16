@@ -15,7 +15,7 @@ def _assert_no_grad(tensor):
 class _CTC(Function):
     @staticmethod
     def forward(ctx, acts, labels, act_lens, label_lens, size_average=False,
-                length_average=False, blank=0):
+                length_average=False):
         is_cuda = True if acts.is_cuda else False
         acts = acts.contiguous()
         loss_func = warp_ctc.gpu_ctc if is_cuda else warp_ctc.cpu_ctc
@@ -28,8 +28,7 @@ class _CTC(Function):
                   label_lens,
                   act_lens,
                   minibatch_size,
-                  costs,
-                  blank)
+                  costs)
 
         costs = torch.FloatTensor([costs.sum()])
 
@@ -60,10 +59,9 @@ class CTCLoss(Module):
             in the batch. If `True`, supersedes `size_average`
             (default: `False`)
     """
-    def __init__(self, blank=0, size_average=False, length_average=False):
+    def __init__(self, size_average=False, length_average=False):
         super(CTCLoss, self).__init__()
         self.ctc = _CTC.apply
-        self.blank = blank
         self.size_average = size_average
         self.length_average = length_average
 
@@ -79,4 +77,4 @@ class CTCLoss(Module):
         _assert_no_grad(act_lens)
         _assert_no_grad(label_lens)
         return self.ctc(acts, labels, act_lens, label_lens, self.size_average,
-                        self.length_average, self.blank)
+                        self.length_average)

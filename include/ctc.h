@@ -11,8 +11,6 @@ extern "C" {
 #endif
 
 //forward declare of CUDA typedef to avoid needing to pull in CUDA headers
-typedef struct CUstream_st* CUstream;
-
 typedef enum {
     CTC_STATUS_SUCCESS = 0,
     CTC_STATUS_MEMOPS_FAILED = 1,
@@ -31,8 +29,7 @@ int get_warpctc_version();
 const char* ctcGetStatusString(ctcStatus_t status);
 
 typedef enum {
-    CTC_CPU = 0,
-    CTC_GPU = 1
+    CTC_CPU = 0
 } ctcComputeLocation;
 
 /** Structure used for options to the CTC compution.  Applications
@@ -46,13 +43,9 @@ struct ctcOptions {
     union {
         /// used when loc == CTC_CPU, the maximum number of threads that can be used
         unsigned int num_threads;
-
-        /// used when loc == CTC_GPU, which stream the kernels should be launched in
-        CUstream stream;
     };
 
     /// the label value/index that the CTC calculation should use as the blank label
-    int blank_label;
 };
 
 /** Compute the connectionist temporal classification loss between a sequence

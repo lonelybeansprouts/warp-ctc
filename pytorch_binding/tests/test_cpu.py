@@ -17,10 +17,8 @@ def test_simple():
                      label_sizes,
                      sizes,
                      minibatch_size,
-                     costs,
-                     0)
+                     costs)
     print('CPU_cost: %f' % costs.sum())
-
 
 @pytest.mark.parametrize("multiplier", [1.0, 200.0])
 def test_medium(multiplier):
@@ -41,33 +39,34 @@ def test_medium(multiplier):
                      label_sizes,
                      sizes,
                      minibatch_size,
-                     costs,
-                     0)
+                     costs)
     print('CPU_cost: %f' % costs.sum())
 
 
-def test_empty_label():
-    probs = torch.FloatTensor([
-        [[0.1, 0.6, 0.1, 0.1, 0.1], [0.1, 0.1, 0.6, 0.1, 0.1]],
-        [[0.6, 0.1, 0.1, 0.1, 0.1], [0.1, 0.1, 0.5, 0.2, 0.1]]
-    ]).contiguous()
 
-    grads = torch.zeros(probs.size())
-    labels = torch.IntTensor([1, 2])
-    label_sizes = torch.IntTensor([2, 0])
-    sizes = torch.IntTensor([2, 2])
-    minibatch_size = probs.size(1)
-    costs = torch.zeros(minibatch_size)
-    warp_ctc.cpu_ctc(probs,
-                     grads,
-                     labels,
-                     label_sizes,
-                     sizes,
-                     minibatch_size,
-                     costs,
-                     0)
-    print('CPU_cost: %f' % costs.sum())
+# def test_empty_label():
+#     probs = torch.FloatTensor([
+#         [[0.1, 0.6, 0.1, 0.1, 0.1], [0.1, 0.1, 0.6, 0.1, 0.1]],
+#         [[0.6, 0.1, 0.1, 0.1, 0.1], [0.1, 0.1, 0.5, 0.2, 0.1]]
+#     ]).contiguous()
 
+#     grads = torch.zeros(probs.size())
+#     labels = torch.IntTensor([1, 2])
+#     label_sizes = torch.IntTensor([2, 0])
+#     sizes = torch.IntTensor([2, 2])
+#     minibatch_size = probs.size(1)
+#     costs = torch.zeros(minibatch_size)
+#     warp_ctc.cpu_ctc(probs,
+#                      grads,
+#                      labels,
+#                      label_sizes,
+#                      sizes,
+#                      minibatch_size,
+#                      costs)
+#     print('CPU_cost: %f' % costs.sum())
+
+
+# test_empty_label()
 
 def test_CTCLoss():
     probs = torch.FloatTensor([[

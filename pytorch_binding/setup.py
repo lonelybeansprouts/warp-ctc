@@ -24,19 +24,9 @@ if not os.path.exists(os.path.join(warp_ctc_path, "libwarpctc" + lib_ext)):
 
 include_dirs = [os.path.realpath('../include')]
 
-if torch.cuda.is_available() or "CUDA_HOME" in os.environ:
-    enable_gpu = True
-else:
-    print("Torch was not built with CUDA support, not building warp-ctc GPU extensions.")
-    enable_gpu = False
 
-if enable_gpu:
-    from torch.utils.cpp_extension import CUDAExtension
 
-    build_extension = CUDAExtension
-    extra_compile_args += ['-DWARPCTC_ENABLE_GPU']
-else:
-    build_extension = CppExtension
+build_extension = CppExtension
 
 ext_modules = [
     build_extension(
