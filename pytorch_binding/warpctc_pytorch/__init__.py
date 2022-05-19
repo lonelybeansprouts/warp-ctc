@@ -50,7 +50,7 @@ class _CTC(Function):
         _grad_output = grad_output.to(ctx.grads.device)
         return ctx.grads.mul_(_grad_output), None, None, None, None, None, None
 
-class CTCLoss(Module):
+class BFCTCLoss(Module):
     """
     Parameters:
         size_average (bool): normalize the loss by the batch size
@@ -60,7 +60,7 @@ class CTCLoss(Module):
             (default: `False`)
     """
     def __init__(self, size_average=False, length_average=False):
-        super(CTCLoss, self).__init__()
+        super(BFCTCLoss, self).__init__()
         self.ctc = _CTC.apply
         self.size_average = size_average
         self.length_average = length_average

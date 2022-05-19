@@ -77,10 +77,11 @@ def test_CTCLoss():
     probs_sizes = torch.IntTensor([2])
     probs.requires_grad_(True)
 
-    ctc_loss = warp_ctc.CTCLoss()
+    ctc_loss = warp_ctc.BFCTCLoss()
     cost = ctc_loss(probs, labels, probs_sizes, label_sizes)
     cost.backward()
 
 
 if __name__ == '__main__':
     pytest.main([__file__])
+    print("test done")
