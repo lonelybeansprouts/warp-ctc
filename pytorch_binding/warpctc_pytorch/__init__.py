@@ -73,6 +73,10 @@ class BFCTCLoss(Module):
         label_lens: Tensor of (batch) containing label length of each example
         """
         assert len(labels.size()) == 1  # labels must be 1 dimensional
+        assert acts.dtype==torch.float32
+        assert labels.dtype==torch.int32
+        assert act_lens.dtype==torch.int32
+        assert label_lens.dtype==torch.int32
         _assert_no_grad(labels)
         _assert_no_grad(act_lens)
         _assert_no_grad(label_lens)
