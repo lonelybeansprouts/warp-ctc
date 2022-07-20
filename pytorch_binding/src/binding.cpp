@@ -1,113 +1,426 @@
 #include <iostream>
 #include <vector>
 
+
+#include <vector>
+#include <queue>
+#include <memory>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <future>
+#include <functional>
+#include <stdexcept>
 #include <numeric>
 
 #include <torch/extension.h>
 
-#ifdef WARPCTC_ENABLE_GPU
-	#include "ATen/cuda/CUDAContext.h"
-	#include <c10/cuda/CUDAGuard.h>
-	#include "ATen/cuda/CUDAEvent.h"
+using Tensor = torch::Tensor;
+using ScalarType = torch::ScalarType;
+using IntArrayRef = torch::IntArrayRef;
 
-    #include "THC.h"
-    extern THCState* state;
-#endif
 
-#include "ctc.h"
+class ThreadPool {
+public:
+    ThreadPool(size_t);
+    template<class F, class... Args>
+    auto enqueue(F&& f, Args&&... args) 
+        -> std::future<typename std::result_of<F(Args...)>::type>;
+    ~ThreadPool();
+private:
+    // need to keep track of threads so we can join them
+    std::vector< std::thread > workers;
+    // the task queue
+    std::queue< std::function<void()> > tasks;
+    
+    // synchronization
+    std::mutex queue_mutex;
+    std::condition_variable condition;
+    bool stop;
+};
 
-int cpu_ctc(torch::Tensor probs,
-            torch::Tensor grads,
-            torch::Tensor labels,
-            torch::Tensor label_sizes,
-            torch::Tensor sizes,
-            int minibatch_size,
-            torch::Tensor costs,
-            int blank_label)
-{
-    float* probs_ptr       = (float*)probs.data_ptr();
-    float* grads_ptr       = grads.storage() ? (float*)grads.data_ptr() : NULL;
-    int*   sizes_ptr       = (int*)sizes.data_ptr();
-    int*   labels_ptr      = (int*)labels.data_ptr();
-    int*   label_sizes_ptr = (int*)label_sizes.data_ptr();
-    float* costs_ptr       = (float*)costs.data_ptr();
 
-    const int probs_size = probs.size(2);
 
-    ctcOptions options;
-    memset(&options, 0, sizeof(options));
-    options.loc = CTC_CPU;
-    options.num_threads = 0; // will use default number of threads
-    options.blank_label = blank_label;
-
-#if defined(CTC_DISABLE_OMP) || defined(APPLE)
-    // have to use at least one
-    options.num_threads = std::max(options.num_threads, (unsigned int) 1);
-#endif
-
-    size_t cpu_size_bytes;
-    get_workspace_size(label_sizes_ptr, sizes_ptr,
-                       probs_size, minibatch_size,
-                       options, &cpu_size_bytes);
-
-    float* cpu_workspace = new float[cpu_size_bytes / sizeof(float)];
-
-    compute_ctc_loss(probs_ptr, grads_ptr,
-                     labels_ptr, label_sizes_ptr,
-                     sizes_ptr, probs_size,
-                     minibatch_size, costs_ptr,
-                     cpu_workspace, options);
-
-    delete[] cpu_workspace;
-    return 1;
+// this ad-hoc converts from targets (l in [1]) to augmented targets (l' in [1]) note that no bound-checking is done
+template<typename target_t>
+static inline int64_t get_target_prime(target_t* target, int64_t offset, int64_t stride, int64_t idx, int64_t BLANK) {
+  if (idx % 2 == 0) {
+    return BLANK;
+  } else {
+    return target[offset + stride * (idx / 2)];
+  }
 }
 
-#ifdef WARPCTC_ENABLE_GPU
-int gpu_ctc(torch::Tensor probs,
-            torch::Tensor grads,
-            torch::Tensor labels,
-            torch::Tensor label_sizes,
-            torch::Tensor sizes,
-            int minibatch_size,
-            torch::Tensor costs,
-            int blank_label)
-{
-    float* probs_ptr       = (float*)probs.data_ptr();
-    float* grads_ptr       = grads.storage() ? (float*)grads.data_ptr() : NULL;
-    int*   sizes_ptr       = (int*)sizes.data_ptr();
-    int*   labels_ptr      = (int*)labels.data_ptr();
-    int*   label_sizes_ptr = (int*)label_sizes.data_ptr();
-    float* costs_ptr       = (float*)costs.data_ptr();
+// This kernel is a relatively straightforward implementation of the alpha calculation in the forward backward algorithm (section 4.1).
+// A (minor) twist is that we are using log-calculations to enhance numerical stability (log_probs and log_alpha).
+// The function returns the loss and the alphas, the alphas are kept for the backward step. The wrapper (ctc_loss below) hides
+// the alphas from the user by only returning the loss.
 
-    const int probs_size = probs.size(2);
+// log_probs: input_len x batch_size x num_labels
+// targets [int64]: batch_size x target_length OR sum(target_lengths)
+template<typename scalar_t, typename target_t>
+std::tuple<Tensor, Tensor> ctc_loss_cpu_template(const Tensor& log_probs, const Tensor& targets, IntArrayRef input_lengths, IntArrayRef target_lengths, int64_t BLANK) {
 
-    ctcOptions options;
-    memset(&options, 0, sizeof(options));
-    options.loc = CTC_GPU;
-    options.blank_label = blank_label;
-    options.stream = at::cuda::getCurrentCUDAStream();
+  constexpr scalar_t neginf = -std::numeric_limits<scalar_t>::infinity();
 
-    size_t gpu_size_bytes;
-    get_workspace_size(label_sizes_ptr, sizes_ptr,
-                       probs_size, minibatch_size,
-                       options, &gpu_size_bytes);
+//   CheckedFrom c = "ctc_loss_cpu";
+//   auto log_probs_arg = TensorArg(log_probs, "log_probs", 1);
+//   auto targets_arg = TensorArg(targets, "targets", 2);
+//   checkScalarType(c, targets_arg, target_scalar_type);
+//   checkDim(c, log_probs_arg, 3);
+//   checkDimRange(c, targets_arg, 1, 3);
 
-    void* gpu_workspace = THCudaMalloc(state, gpu_size_bytes);
+  int64_t batch_size = log_probs.size(1);
+  int64_t num_labels = log_probs.size(2);
+//   TORCH_CHECK((0 <= BLANK) && (BLANK < num_labels), "blank must be in label range");
+//   TORCH_CHECK((int64_t) input_lengths.size() == batch_size, "input_lengths must be of size batch_size");
+//   TORCH_CHECK((int64_t) target_lengths.size() == batch_size, "target_lengths must be of size batch_size");
 
-    compute_ctc_loss(probs_ptr, grads_ptr,
-                     labels_ptr, label_sizes_ptr,
-                     sizes_ptr, probs_size,
-                     minibatch_size, costs_ptr,
-                     gpu_workspace, options);
+  size_t tg_target_stride;
+  int64_t max_target_length = 0;
+  std::vector<int64_t> tg_batch_offsets(batch_size);
+  if (targets.dim() == 1) { // concatenated targets
+    int64_t pos = 0;
+    for (int64_t i = 0; i < batch_size; i++) {
+      tg_batch_offsets[i] = pos;
+      pos += target_lengths[i];
+      if (max_target_length < target_lengths[i])
+         max_target_length = target_lengths[i];
+    }
+    tg_target_stride = targets.stride(0);
+    // checkSize(c, targets_arg, 0, pos);
+  }else { // batch x max_target_length
+    // dim is 2
+    int64_t tg_batch_stride = targets.stride(0);
+    for (int64_t i = 0; i < batch_size; i++) {
+      tg_batch_offsets[i] = i * tg_batch_stride;
+      if (max_target_length < target_lengths[i])
+        max_target_length = target_lengths[i];
+    }
+    tg_target_stride = targets.stride(1);
+    // checkSize(c, targets_arg, 0, batch_size);
+    // TORCH_CHECK(targets.size(1) >= max_target_length,
+    //          "Expected tensor to have size at least ", max_target_length, " at dimension 1, but got size ", targets.size(1), " for ", targets_arg,
+    //          " (while checking arguments for ", c, ")");
+  }
+//   int64_t max_input_length = log_probs.size(0);
+//   for (int64_t b = 0; b < batch_size; b++) {
+//     TORCH_CHECK(input_lengths[b] <= max_input_length,
+//              "Expected input_lengths to have value at most ", max_input_length, ", but got value ", input_lengths[b],
+//              " (while checking arguments for ", c, ")");
+//   }
 
-    THCudaFree(state, (void *) gpu_workspace);
-    return 1;
+  Tensor log_alpha = at::empty({batch_size, log_probs.size(0), 2*max_target_length+1}, log_probs.options());
+  Tensor neg_log_likelihood = at::empty({batch_size}, log_probs.options());
+
+  auto lpp  = log_probs.permute({1,0,2});
+  auto log_probs_a_global = lpp.accessor<scalar_t, 3>();
+  auto log_alpha_a_global = log_alpha.accessor<scalar_t, 3>();
+  auto targets_data = targets.data_ptr<target_t>();
+  auto neg_log_likelihood_a = neg_log_likelihood.accessor<scalar_t, 1>();
+
+  // alpha calculation for the first row, the three equations for alpha_1 above eq (6)
+  // first the default
+  log_alpha.narrow(1, 0, 1).fill_(neginf);
+
+  ThreadPool thread_pool(batch_size);
+  std::vector<std::future<int>> rets;
+  for (int64_t batch_idx=0; batch_idx<batch_size; batch_idx++){
+    auto ret = thread_pool.enqueue([&](int64_t b) {
+        int64_t input_length = input_lengths[b];
+        int64_t target_length = target_lengths[b];
+        auto log_probs_a = log_probs_a_global[b];
+        auto log_alpha_a = log_alpha_a_global[b];
+        int64_t tg_batch_offset = tg_batch_offsets[b];
+
+        // the first two items of alpha_t above eq (6)
+        log_alpha_a[0][0] = log_probs_a[0][BLANK];
+        if (target_length > 0)
+            log_alpha_a[0][1] = log_probs_a[0][get_target_prime(targets_data, tg_batch_offset, tg_target_stride, 1, BLANK)];
+
+        // now the loop over the inputs
+        for (int64_t t=1; t<input_length; t++) {
+            for (int64_t s=0; s<2*target_length+1; s++) {
+            auto current_target_prime = get_target_prime(targets_data, tg_batch_offset, tg_target_stride, s, BLANK);
+            // this loop over s could be parallel/vectorized, too, but the required items are one index apart
+            // alternatively, one might consider moving s to the outer loop to cache current_target_prime more (but then it needs to be descending)
+            // for the cuda implementation, that gave a speed boost.
+            // This is eq (6) and (7), la1,2,3 are the three summands. We keep track of the maximum for the logsumexp calculation.
+
+            scalar_t la1 = log_alpha_a[t-1][s];
+            scalar_t lamax = la1;
+            scalar_t la2, la3;
+            if (s > 0) {
+                la2 = log_alpha_a[t-1][s-1];
+                if (la2 > lamax)
+                lamax = la2;
+            } else {
+                la2 = neginf;
+            }
+            if ((s > 1) && (get_target_prime(targets_data, tg_batch_offset, tg_target_stride, s-2, BLANK) !=
+                            current_target_prime)) {
+                la3 = log_alpha_a[t-1][s-2];
+                if (la3 > lamax)
+                lamax = la3;
+            } else {
+                la3 = neginf;
+            }
+            if (lamax == neginf) // cannot do neginf-neginf
+                lamax = 0;
+            // this is the assignment of eq (6)
+            log_alpha_a[t][s] = std::log(std::exp(la1-lamax)+std::exp(la2-lamax)+std::exp(la3-lamax))+lamax + log_probs_a[t][current_target_prime];
+            }
+        }
+        // the likelihood is the the sum of the last two alphas, eq (8), the loss is the negative log likelihood
+        if (target_length == 0) {
+            // if the target is empty then there is no preceding BLANK state and hence there is no path to merge
+            neg_log_likelihood_a[b] = -log_alpha_a[input_length-1][0];
+        } else {
+            scalar_t l1 = log_alpha_a[input_length-1][target_length*2];
+            scalar_t l2 = log_alpha_a[input_length-1][target_length*2-1];
+            scalar_t m = std::max(l1, l2);
+            m = ((m == neginf) ? 0 : m);
+            scalar_t log_likelihood = std::log(std::exp(l1-m)+std::exp(l2-m))+m;
+            neg_log_likelihood_a[b] = -log_likelihood;
+        }
+        return 0;
+    }, batch_idx);
+    rets.emplace_back(std::move(ret));
+  }
+  for (int batch_idx=0; batch_idx<batch_size; batch_idx++){ //sychronize
+    assert(rets[batch_idx].get() == 0);
+  }
+
+  return std::make_tuple(neg_log_likelihood, log_alpha);
 }
-#endif
+
+
+// // This is the backward. It consists of two phases:
+// // a) computing the beta analogous to the alphas in the forward (backward half of the forward-backward algorithm) (eq (10) and (11))
+// // b) collecting the per-activation characters for all s and wrapping the gradient (eq (16), the collection is the sum)
+// template<typename scalar_t, ScalarType target_scalar_type>
+// Tensor ctc_loss_backward_cpu_template(const Tensor& grad_out, const Tensor& log_probs, const Tensor& targets, IntArrayRef input_lengths, IntArrayRef target_lengths,
+//                                       const Tensor& neg_log_likelihood, const Tensor& log_alpha, int64_t BLANK, bool zero_infinity) {
+//   constexpr scalar_t neginf = -std::numeric_limits<scalar_t>::infinity();
+//   using target_t = typename std::conditional<target_scalar_type == kInt, int, int64_t>::type;
+//   int64_t max_input_length = log_probs.size(0);
+//   int64_t batch_size = log_probs.size(1);
+//   int64_t num_labels = log_probs.size(2);
+//   Tensor grad = at::full_like(log_probs, neginf, LEGACY_CONTIGUOUS_MEMORY_FORMAT); // at this point, this is log of empty sum
+
+//   // The admin bits. We don't do much checking and assume that the forward did.
+//   int64_t tg_target_stride;
+//   int64_t max_target_length;
+//   std::vector<int64_t> tg_batch_offsets(batch_size);
+
+//   if (targets.dim() == 1) { // concatenated targets
+//     int64_t pos = 0;
+//     max_target_length = 0;
+//     for (int64_t i = 0; i < batch_size; i++) {
+//       tg_batch_offsets[i] = pos;
+//       pos += target_lengths[i];
+//       if (max_target_length < target_lengths[i])
+//         max_target_length = target_lengths[i];
+//     }
+//     tg_target_stride = targets.stride(0);
+//   }
+//   else { // batch x max_target_length
+//     // dim is 2
+//     int64_t tg_batch_stride = targets.stride(0);
+//     for (int64_t i = 0; i < batch_size; i++) {
+//       tg_batch_offsets[i] = i * tg_batch_stride;
+//     }
+//     tg_target_stride = targets.stride(1);
+//     max_target_length = targets.size(1);
+//   }
+
+//   Tensor log_beta = at::empty_like(log_alpha, LEGACY_CONTIGUOUS_MEMORY_FORMAT);  // could be optimized to use only 2 rows
+//   auto lpp  = log_probs.permute({1,0,2});
+//   auto log_probs_a_global = lpp.accessor<scalar_t, 3>();
+//   auto log_alpha_a_global = log_alpha.accessor<scalar_t, 3>();
+//   auto log_beta_a_global = log_beta.accessor<scalar_t, 3>();
+//   auto gp = grad.permute({1,0,2});
+//   auto grad_a_global = gp.accessor<scalar_t, 3>();
+//   auto targets_data = targets.data_ptr<target_t>();
+
+//   at::parallel_for(0, batch_size, 0, [&](int64_t start, int64_t end) {
+//     for (int64_t b = start; b < end; b++) {
+//       scalar_t nll = neg_log_likelihood.accessor<scalar_t, 1>()[b];
+//       if (zero_infinity &&  nll == std::numeric_limits<scalar_t>::infinity()) {
+//         grad.narrow(1, b, 1).zero_();
+//         continue;
+//       }
+
+//       auto log_probs_a = log_probs_a_global[b];
+//       auto log_alpha_a = log_alpha_a_global[b];
+//       auto log_beta_a = log_beta_a_global[b];
+//       auto grad_a = grad_a_global[b];
+//       int64_t input_length = input_lengths[b];
+//       int64_t target_length = target_lengths[b];
+//       int64_t tg_batch_offset = tg_batch_offsets[b];
+
+//       // the initialization of beta before eq (10)
+//       // here we do the fill for each batch item separately, as the input lengths will differ, so the t in which
+//       // we start varies
+//       if (input_length > 0) {
+//         log_beta.narrow(0, b, 1).narrow(1, input_length-1, 1).fill_(neginf);
+//         log_beta_a[input_length-1][2*target_length] = log_probs_a[input_length-1][BLANK];
+//         grad_a[input_length-1][BLANK] = log_alpha_a[input_length-1][2*target_length] + log_beta_a[input_length-1][2*target_length];
+
+//         if (target_length > 0) {
+//           auto current_target_prime = get_target_prime(targets_data, tg_batch_offset, tg_target_stride, 2*target_length-1, BLANK);
+//           log_beta_a[input_length-1][2*target_length-1] = log_probs_a[input_length-1][current_target_prime];
+
+//           // the first two are a blank and a non-blank, so we know they are different and we don't need to do log+
+//           grad_a[input_length-1][current_target_prime] = log_alpha_a[input_length-1][2*target_length-1] + log_beta_a[input_length-1][2*target_length-1];
+//         }
+//       }
+
+//       // now loop applying eq (10) / (11)
+//       for (int64_t t=input_length-2; t>=0; t--) {
+//         // this loop over s could be parallel/vectorized and doesn't really need to be descending...
+//         // alternatively, one might consider moving s to the outer loop to cache current_target_prime more (but then it needs to be descending)
+//         // for the cuda implementation, that gave a speed boost.
+//         for (int64_t s=2*target_length; s>=0; s--) {
+//           scalar_t lb1 = log_beta_a[t+1][s];
+//           scalar_t lbmax = lb1;
+//           scalar_t lb2, lb3;
+//           auto current_target_prime = get_target_prime(targets_data, tg_batch_offset, tg_target_stride, s, BLANK);
+//           if (s < 2*target_length) {
+//             lb2 = log_beta_a[t+1][s+1];
+//             if (lb2 > lbmax)
+//               lbmax = lb2;
+//           } else {
+//             lb2 = neginf;
+//           }
+//           if ((s < 2*target_length-1) && (get_target_prime(targets_data, tg_batch_offset, tg_target_stride, s+2, BLANK) !=
+//                                           current_target_prime)) {
+//             lb3 = log_beta_a[t+1][s+2];
+//             if (lb3 > lbmax)
+//               lbmax = lb3;
+//           } else {
+//             lb3 = neginf;
+//           }
+//           if (lbmax == neginf)
+//             lbmax = 0;
+
+//           log_beta_a[t][s] = std::log(std::exp(lb1-lbmax)+std::exp(lb2-lbmax)+std::exp(lb3-lbmax))+lbmax + log_probs_a[t][current_target_prime];
+//           // one might check whether one can vectorize this better when done after the t-loop...
+//           // now that we have beta, we fill in the sum of alpha*beta in eq (16)
+//           // in contrast to the cuda implementation, we only parallelize over the batch, so we don't have a concurrency
+//           // issue (several s can map to the same target character)
+//           // collected[b, t, target'[s]] "log+=" log_alpha[t, s]+log_beta[t, s]
+//           scalar_t log_alpha_beta =  log_alpha_a[t][s] + log_beta_a[t][s];
+//           scalar_t &lcab = grad_a[t][current_target_prime];
+//           if (lcab == neginf) {
+//             lcab = log_alpha_beta;
+//           } else {
+//             scalar_t max = std::max(lcab, log_alpha_beta);
+//             lcab = std::log(std::exp(lcab-max)+std::exp(log_alpha_beta-max))+max;
+//           }
+//         }
+//       }
+
+//       // now grad has the sum of eq (16)
+//       // now we wrap up the calculation by adding in the remaining items of eq (16)
+//       // this could be a great target for further vectorization.
+//       // grad is the output gradient, nll is the loss. Note that the likelihood -nll is the Z of eq (16)
+//       scalar_t gr =  grad_out.accessor<scalar_t, 1>()[b];
+//       for (int64_t t = 0; t < input_length; t++) { // or go for the full thing?
+//         for (int64_t c = 0; c < num_labels; c++) {
+//           scalar_t& res = grad_a[t][c];
+//           scalar_t lp = log_probs_a[t][c];
+//           res = (std::exp(lp)-std::exp(res + nll - lp)) * gr;
+//         }
+//       }
+//       // zero the remainder
+//       if (input_length < max_input_length) {
+//         grad.narrow(0, input_length, max_input_length - input_length).narrow(1, b, 1).zero_();
+//       }
+//     }
+//   });
+//   return grad;
+// }
+
+
+
+
+
+
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("cpu_ctc", &cpu_ctc, "CTC Loss function with cpu");
-#ifdef WARPCTC_ENABLE_GPU
-  m.def("gpu_ctc", &gpu_ctc, "CTC Loss function with gpu");
-#endif
+  m.def("bf_ctc", &ctc_loss_cpu_template<float, int64_t>, "CTC Loss function with cpu");
+}
+
+
+
+
+
+
+
+ 
+// the constructor just launches some amount of workers
+inline ThreadPool::ThreadPool(size_t threads)
+    :   stop(false)
+{
+    for(size_t i = 0;i<threads;++i)
+        workers.emplace_back(
+            [this]
+            {
+                for(;;)
+                {
+                    std::function<void()> task;
+
+                    {
+                        std::unique_lock<std::mutex> lock(this->queue_mutex);
+                        this->condition.wait(lock,
+                            [this]{ return this->stop || !this->tasks.empty(); });
+                        if(this->stop && this->tasks.empty())
+                            return;
+                        task = std::move(this->tasks.front());
+                        this->tasks.pop();
+                    }
+
+                    task();
+                }
+            }
+        );
+}
+
+// add new work item to the pool
+template<class F, class... Args>
+auto ThreadPool::enqueue(F&& f, Args&&... args) 
+    -> std::future<typename std::result_of<F(Args...)>::type>
+{
+    using return_type = typename std::result_of<F(Args...)>::type;
+
+    auto task = std::make_shared< std::packaged_task<return_type()> >(
+            std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+        );
+        
+    std::future<return_type> res = task->get_future();
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+
+        // don't allow enqueueing after stopping the pool
+        if(stop)
+            throw std::runtime_error("enqueue on stopped ThreadPool");
+
+        tasks.emplace([task](){ (*task)(); });
+    }
+    condition.notify_one();
+    return res;
+}
+
+// the destructor joins all threads
+inline ThreadPool::~ThreadPool()
+{
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        stop = true;
+    }
+    condition.notify_all();
+    for(std::thread &worker: workers)
+        worker.join();
 }
