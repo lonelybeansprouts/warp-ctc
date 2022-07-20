@@ -1,87 +1,82 @@
 import torch
-import warpctc_pytorch as warp_ctc
-import pytest
 
+from bfctc_pytorch import *
+from torch.autograd import Variable
 
 def test_simple():
-    probs = torch.FloatTensor([[[0.1, 0.6, 0.1, 0.1, 0.1], [0.1, 0.1, 0.6, 0.1, 0.1]]]).transpose(0, 1).contiguous()
-    grads = torch.zeros(probs.size())
-    labels = torch.IntTensor([1, 2])
-    label_sizes = torch.IntTensor([2])
-    sizes = torch.IntTensor(probs.size(1)).fill_(probs.size(0))
-    minibatch_size = probs.size(1)
-    costs = torch.zeros(minibatch_size)
-    warp_ctc.cpu_ctc(probs,
-                     grads,
-                     labels,
-                     label_sizes,
-                     sizes,
-                     minibatch_size,
-                     costs,
-                     0)
-    print('CPU_cost: %f' % costs.sum())
+    log_probs = torch.FloatTensor([[[0.1, 0.6, 0.1, 0.1, 0.1], 
+                                    [0.1, 0.1, 0.6, 0.1, 0.1]]]).transpose(0, 1).log().contiguous()
+    print(log_probs)
+    input_lengths = torch.LongTensor([2])
+    labels = torch.LongTensor([1, 2])
+    target_lengths = torch.LongTensor([2])
+    neg_log_likelihood, log_alpha = bf_ctc_forward(log_probs, labels, list(input_lengths), list(target_lengths))
+    print(neg_log_likelihood)
+    print(log_alpha)
+
+    grad_out=torch.FloatTensor([1.0])
+    grad, log_beta = bf_ctc_backward(grad_out, log_probs, labels, list(input_lengths), list(target_lengths), neg_log_likelihood, log_alpha, True)
+
+    print(grad)
+    print(log_beta)
+    assert(log_alpha[0, 1, 1] == log_beta[0, 0, 0])
 
 
-@pytest.mark.parametrize("multiplier", [1.0, 200.0])
-def test_medium(multiplier):
-    probs = torch.FloatTensor([
-        [[0.1, 0.6, 0.1, 0.1, 0.1], [0.1, 0.1, 0.6, 0.1, 0.1]],
-        [[0.6, 0.1, 0.1, 0.1, 0.1], [0.1, 0.1, 0.5, 0.2, 0.1]]
-    ]).contiguous() * multiplier
-
-    grads = torch.zeros(probs.size())
-    labels = torch.IntTensor([1, 2, 1, 2])
-    label_sizes = torch.IntTensor([2, 2])
-    sizes = torch.IntTensor([2, 2])
-    minibatch_size = probs.size(1)
-    costs = torch.zeros(minibatch_size)
-    warp_ctc.cpu_ctc(probs,
-                     grads,
-                     labels,
-                     label_sizes,
-                     sizes,
-                     minibatch_size,
-                     costs,
-                     0)
-    print('CPU_cost: %f' % costs.sum())
+test_simple()
 
 
-def test_empty_label():
-    probs = torch.FloatTensor([
-        [[0.1, 0.6, 0.1, 0.1, 0.1], [0.1, 0.1, 0.6, 0.1, 0.1]],
-        [[0.6, 0.1, 0.1, 0.1, 0.1], [0.1, 0.1, 0.5, 0.2, 0.1]]
-    ]).contiguous()
 
-    grads = torch.zeros(probs.size())
-    labels = torch.IntTensor([1, 2])
-    label_sizes = torch.IntTensor([2, 0])
-    sizes = torch.IntTensor([2, 2])
-    minibatch_size = probs.size(1)
-    costs = torch.zeros(minibatch_size)
-    warp_ctc.cpu_ctc(probs,
-                     grads,
-                     labels,
-                     label_sizes,
-                     sizes,
-                     minibatch_size,
-                     costs,
-                     0)
-    print('CPU_cost: %f' % costs.sum())
+def test_large():
+    output_dim = 6
+    input_lengths = torch.IntTensor([111, 222, 333, 444, 555, 666, 777, 888, 999, 10000])
+    log_probs = torch.zeros((10000, 10, output_dim))
+    for i, length in enumerate(list(input_lengths)):
+        t_probs = torch.nn.functional.log_softmax(torch.randn((length, output_dim), dtype=torch.float32), dim=1)
+        log_probs[0:length, i, :] = t_probs
+    
+    print(log_probs[:,0,:])
+    
+    target_lengths = torch.IntTensor([50, 111, 222, 333, 444, 555, 777, 888, 999, 1234])
+    labels = []
+    for i, length in enumerate(list(target_lengths)):
+        label = torch.randint(low=0, high=output_dim, size=(length,))
+        labels.append(label)
+    labels = torch.cat(labels, dim=0)
 
+    neg_log_likelihood, log_alpha = neg_log_likelihood, log_alpha = bf_ctc_forward(log_probs, labels, list(input_lengths), list(target_lengths))
+        
+    grad_out=torch.ones((10,), dtype=torch.float32)
+    grad, log_beta = bf_ctc_backward(grad_out, log_probs, labels, list(input_lengths), list(target_lengths), neg_log_likelihood, log_alpha, True)
 
-def test_CTCLoss():
-    probs = torch.FloatTensor([[
-        [0.1, 0.6, 0.1, 0.1, 0.1], [0.1, 0.1, 0.6, 0.1, 0.1]
-    ]]).transpose(0, 1).contiguous()
-    labels = torch.IntTensor([1, 2])
-    label_sizes = torch.IntTensor([2])
-    probs_sizes = torch.IntTensor([2])
-    probs.requires_grad_(True)
+    print(grad[:, 0, :])
 
-    ctc_loss = warp_ctc.CTCLoss()
-    cost = ctc_loss(probs, labels, probs_sizes, label_sizes)
-    cost.backward()
+    for i in range(10):
+        print(log_alpha[i, input_lengths[i]-1, target_lengths[i]-1])
+        print(log_beta[i, 0, 0])
+        assert(abs(log_alpha[i, input_lengths[i]-1, target_lengths[i]-1].item()-log_beta[i, 0, 0].item()) < 1.0)
+
+test_large()
 
 
-if __name__ == '__main__':
-    pytest.main([__file__])
+def test_loss():
+    output_dim = 1024
+    input_lengths = torch.IntTensor([111, 222, 333, 444, 555, 666, 777, 888, 999, 10000])
+    log_probs = torch.zeros((10000, 10, output_dim))
+    for i, length in enumerate(list(input_lengths)):
+        t_probs = torch.nn.functional.log_softmax(torch.randn((length, output_dim), dtype=torch.float32), dim=1)
+        log_probs[0:length, i, :] = t_probs
+    log_probs = Variable(log_probs,requires_grad=True)
+
+    target_lengths = torch.IntTensor([50, 111, 222, 333, 444, 555, 777, 888, 999, 1234])
+
+    labels = []
+    for i, length in enumerate(list(target_lengths)):
+        label = torch.randint(low=0, high=output_dim, size=(length,))
+        labels.append(label)
+    labels = torch.cat(labels, dim=0)
+    bf_ctc = BfCtcLoss(size_average=True)
+    costs = bf_ctc(log_probs, labels,  input_lengths, target_lengths)
+    costs.backward()
+    print(costs)
+
+test_loss()
