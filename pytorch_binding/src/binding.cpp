@@ -71,7 +71,7 @@ std::tuple<Tensor, Tensor> ctc_loss_cpu_template(const Tensor& log_probs, const 
 //   checkDimRange(c, targets_arg, 1, 3);
 
   int64_t batch_size = log_probs.size(1);
-  int64_t num_labels = log_probs.size(2);
+//   int64_t num_labels = log_probs.size(2);
 //   TORCH_CHECK((0 <= BLANK) && (BLANK < num_labels), "blank must be in label range");
 //   TORCH_CHECK((int64_t) input_lengths.size() == batch_size, "input_lengths must be of size batch_size");
 //   TORCH_CHECK((int64_t) target_lengths.size() == batch_size, "target_lengths must be of size batch_size");

@@ -12,7 +12,7 @@ build_extension = CppExtension
 
 ext_modules = [
     build_extension(
-        name='warpctc_pytorch._bf_ctc',
+        name='bfctc_pytorch._bf_ctc',
         language='c++',
         sources=['src/binding.cpp'],
         extra_compile_args=extra_compile_args
