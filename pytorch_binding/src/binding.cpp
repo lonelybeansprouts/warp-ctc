@@ -139,7 +139,7 @@ std::tuple<Tensor, Tensor> ctc_loss_cpu_template(const Tensor& log_probs, const 
 // // a) computing the beta analogous to the alphas in the forward (backward half of the forward-backward algorithm) (eq (10) and (11))
 // // b) collecting the per-activation characters for all s and wrapping the gradient (eq (16), the collection is the sum)
 template<typename scalar_t, typename target_t>
-Tensor ctc_loss_backward_cpu_template(const Tensor& grad_out, const Tensor& log_probs, const Tensor& targets, IntArrayRef input_lengths, IntArrayRef target_lengths,
+std::tuple<Tensor, Tensor>  ctc_loss_backward_cpu_template(const Tensor& grad_out, const Tensor& log_probs, const Tensor& targets, IntArrayRef input_lengths, IntArrayRef target_lengths,
                                       const Tensor& neg_log_likelihood, const Tensor& log_alpha, bool zero_infinity) {
   constexpr scalar_t neginf = -std::numeric_limits<scalar_t>::infinity();
   int64_t max_input_length = log_probs.size(0);
@@ -186,7 +186,7 @@ Tensor ctc_loss_backward_cpu_template(const Tensor& grad_out, const Tensor& log_
     scalar_t nll = neg_log_likelihood.accessor<scalar_t, 1>()[b];
     if (zero_infinity &&  nll == std::numeric_limits<scalar_t>::infinity()) {
         grad.narrow(1, b, 1).zero_();
-        continue;
+        return;
     }
 
     auto log_probs_a = log_probs_a_global[b];
@@ -208,130 +208,31 @@ Tensor ctc_loss_backward_cpu_template(const Tensor& grad_out, const Tensor& log_
 
     // now loop applying eq (10) / (11)
     for (int64_t t=input_length-2; t>=0; t--) {
-        // this loop over s could be parallel/vectorized and doesn't really need to be descending...
-        // alternatively, one might consider moving s to the outer loop to cache current_target_prime more (but then it needs to be descending)
-        // for the cuda implementation, that gave a speed boost.
-        for (int64_t s=target_length-1; s>=0; s--) {
-            scalar_t lb1 = log_beta_a[t+1][s];
-            scalar_t lbmax = lb1;
-            scalar_t lb2, lb3;
-            auto current_target_prime = get_target_prime(targets_data, tg_batch_offset, tg_target_stride, s, BLANK);
-            if (s < 2*target_length) {
+      // this loop over s could be parallel/vectorized and doesn't really need to be descending...
+      // alternatively, one might consider moving s to the outer loop to cache current_target_prime more (but then it needs to be descending)
+      // for the cuda implementation, that gave a speed boost.
+      for (int64_t s=target_length-1; s>=0; s--) {
+          auto current_target_prime = get_target_prime(targets_data, tg_batch_offset, tg_target_stride, s);
+          scalar_t lb1;
+          if (s<target_length-1 && current_target_prime==get_target_prime(targets_data, tg_batch_offset, tg_target_stride, s+1)){
+            lb1 = neginf;
+          }else{
+            lb1 = log_beta_a[t+1][s];
+          }
+          scalar_t lbmax = lb1;
+          scalar_t lb2;
+          if (s < target_length-1) {
             lb2 = log_beta_a[t+1][s+1];
             if (lb2 > lbmax)
                 lbmax = lb2;
-            } else {
-            lb2 = neginf;
-            }
-            if ((s < 2*target_length-1) && (get_target_prime(targets_data, tg_batch_offset, tg_target_stride, s+2, BLANK) !=
-                                            current_target_prime)) {
-            lb3 = log_beta_a[t+1][s+2];
-            if (lb3 > lbmax)
-                lbmax = lb3;
-            } else {
-            lb3 = neginf;
-            }
-            if (lbmax == neginf)
-            lbmax = 0;
-
-            log_beta_a[t][s] = std::log(std::exp(lb1-lbmax)+std::exp(lb2-lbmax)+std::exp(lb3-lbmax))+lbmax + log_probs_a[t][current_target_prime];
-            // one might check whether one can vectorize this better when done after the t-loop...
-            // now that we have beta, we fill in the sum of alpha*beta in eq (16)
-            // in contrast to the cuda implementation, we only parallelize over the batch, so we don't have a concurrency
-            // issue (several s can map to the same target character)
-            // collected[b, t, target'[s]] "log+=" log_alpha[t, s]+log_beta[t, s]
-            scalar_t log_alpha_beta =  log_alpha_a[t][s] + log_beta_a[t][s];
-            scalar_t &lcab = grad_a[t][current_target_prime];
-            if (lcab == neginf) {
-            lcab = log_alpha_beta;
-            } else {
-            scalar_t max = std::max(lcab, log_alpha_beta);
-            lcab = std::log(std::exp(lcab-max)+std::exp(log_alpha_beta-max))+max;
-            }
-        }
-    }
-
-      // now grad has the sum of eq (16)
-      // now we wrap up the calculation by adding in the remaining items of eq (16)
-      // this could be a great target for further vectorization.
-      // grad is the output gradient, nll is the loss. Note that the likelihood -nll is the Z of eq (16)
-      scalar_t gr =  grad_out.accessor<scalar_t, 1>()[b];
-      for (int64_t t = 0; t < input_length; t++) { // or go for the full thing?
-        for (int64_t c = 0; c < num_labels; c++) {
-          scalar_t& res = grad_a[t][c];
-          scalar_t lp = log_probs_a[t][c];
-          res = (std::exp(lp)-std::exp(res + nll - lp)) * gr;
-        }
-      }
-      // zero the remainder
-      if (input_length < max_input_length) {
-        grad.narrow(0, input_length, max_input_length - input_length).narrow(1, b, 1).zero_();
-      }
-    }
-  }
-
-  at::parallel_for(0, batch_size, 0, [&](int64_t start, int64_t end) {
-    for (int64_t b = start; b < end; b++) {
-      scalar_t nll = neg_log_likelihood.accessor<scalar_t, 1>()[b];
-      if (zero_infinity &&  nll == std::numeric_limits<scalar_t>::infinity()) {
-        grad.narrow(1, b, 1).zero_();
-        continue;
-      }
-
-      auto log_probs_a = log_probs_a_global[b];
-      auto log_alpha_a = log_alpha_a_global[b];
-      auto log_beta_a = log_beta_a_global[b];
-      auto grad_a = grad_a_global[b];
-      int64_t input_length = input_lengths[b];
-      int64_t target_length = target_lengths[b];
-      int64_t tg_batch_offset = tg_batch_offsets[b];
-
-      // the initialization of beta before eq (10)
-      // here we do the fill for each batch item separately, as the input lengths will differ, so the t in which
-      // we start varies
-      if (input_length > 0) {
-        log_beta.narrow(0, b, 1).narrow(1, input_length-1, 1).fill_(neginf);
-        log_beta_a[input_length-1][2*target_length] = log_probs_a[input_length-1][BLANK];
-        grad_a[input_length-1][BLANK] = log_alpha_a[input_length-1][2*target_length] + log_beta_a[input_length-1][2*target_length];
-
-        if (target_length > 0) {
-          auto current_target_prime = get_target_prime(targets_data, tg_batch_offset, tg_target_stride, 2*target_length-1, BLANK);
-          log_beta_a[input_length-1][2*target_length-1] = log_probs_a[input_length-1][current_target_prime];
-
-          // the first two are a blank and a non-blank, so we know they are different and we don't need to do log+
-          grad_a[input_length-1][current_target_prime] = log_alpha_a[input_length-1][2*target_length-1] + log_beta_a[input_length-1][2*target_length-1];
-        }
-      }
-
-      // now loop applying eq (10) / (11)
-      for (int64_t t=input_length-2; t>=0; t--) {
-        // this loop over s could be parallel/vectorized and doesn't really need to be descending...
-        // alternatively, one might consider moving s to the outer loop to cache current_target_prime more (but then it needs to be descending)
-        // for the cuda implementation, that gave a speed boost.
-        for (int64_t s=2*target_length; s>=0; s--) {
-          scalar_t lb1 = log_beta_a[t+1][s];
-          scalar_t lbmax = lb1;
-          scalar_t lb2, lb3;
-          auto current_target_prime = get_target_prime(targets_data, tg_batch_offset, tg_target_stride, s, BLANK);
-          if (s < 2*target_length) {
-            lb2 = log_beta_a[t+1][s+1];
-            if (lb2 > lbmax)
-              lbmax = lb2;
           } else {
             lb2 = neginf;
           }
-          if ((s < 2*target_length-1) && (get_target_prime(targets_data, tg_batch_offset, tg_target_stride, s+2, BLANK) !=
-                                          current_target_prime)) {
-            lb3 = log_beta_a[t+1][s+2];
-            if (lb3 > lbmax)
-              lbmax = lb3;
-          } else {
-            lb3 = neginf;
-          }
+
           if (lbmax == neginf)
             lbmax = 0;
 
-          log_beta_a[t][s] = std::log(std::exp(lb1-lbmax)+std::exp(lb2-lbmax)+std::exp(lb3-lbmax))+lbmax + log_probs_a[t][current_target_prime];
+          log_beta_a[t][s] = std::log(std::exp(lb1-lbmax)+std::exp(lb2-lbmax))+lbmax + log_probs_a[t][current_target_prime];
           // one might check whether one can vectorize this better when done after the t-loop...
           // now that we have beta, we fill in the sum of alpha*beta in eq (16)
           // in contrast to the cuda implementation, we only parallelize over the batch, so we don't have a concurrency
@@ -345,28 +246,37 @@ Tensor ctc_loss_backward_cpu_template(const Tensor& grad_out, const Tensor& log_
             scalar_t max = std::max(lcab, log_alpha_beta);
             lcab = std::log(std::exp(lcab-max)+std::exp(log_alpha_beta-max))+max;
           }
-        }
-      }
-
-      // now grad has the sum of eq (16)
-      // now we wrap up the calculation by adding in the remaining items of eq (16)
-      // this could be a great target for further vectorization.
-      // grad is the output gradient, nll is the loss. Note that the likelihood -nll is the Z of eq (16)
-      scalar_t gr =  grad_out.accessor<scalar_t, 1>()[b];
-      for (int64_t t = 0; t < input_length; t++) { // or go for the full thing?
-        for (int64_t c = 0; c < num_labels; c++) {
-          scalar_t& res = grad_a[t][c];
-          scalar_t lp = log_probs_a[t][c];
-          res = (std::exp(lp)-std::exp(res + nll - lp)) * gr;
-        }
-      }
-      // zero the remainder
-      if (input_length < max_input_length) {
-        grad.narrow(0, input_length, max_input_length - input_length).narrow(1, b, 1).zero_();
       }
     }
-  });
-  return grad;
+
+    // now grad has the sum of eq (16)
+    // now we wrap up the calculation by adding in the remaining items of eq (16)
+    // this could be a great target for further vectorization.
+    // grad is the output gradient, nll is the loss. Note that the likelihood -nll is the Z of eq (16)
+    scalar_t gr =  grad_out.accessor<scalar_t, 1>()[b];
+    for (int64_t t = 0; t < input_length; t++) { // or go for the full thing?
+      for (int64_t c = 0; c < num_labels; c++) {
+        scalar_t& res = grad_a[t][c];
+        scalar_t lp = log_probs_a[t][c];
+        res = (std::exp(lp)-std::exp(res + nll - lp)) * gr;
+      }
+    }
+    // zero the remainder
+    if (input_length < max_input_length) {
+      grad.narrow(0, input_length, max_input_length - input_length).narrow(1, b, 1).zero_();
+    }
+  };
+  
+  std::vector<std::unique_ptr<std::thread>> threads;
+  threads.resize(batch_size);
+  for (int64_t batch_idx=0; batch_idx<batch_size; batch_idx++){
+    threads[batch_idx].reset(new std::thread(process, batch_idx));
+  }
+  for (int batch_idx=0; batch_idx<batch_size; batch_idx++){ //sychronize
+    threads[batch_idx]->join();
+  }
+
+  return std::make_tuple(grad, log_beta);
 }
 
 
@@ -377,7 +287,8 @@ Tensor ctc_loss_backward_cpu_template(const Tensor& grad_out, const Tensor& log_
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("bf_ctc_forward", &ctc_loss_cpu_template<float, int64_t>, "CTC Loss function with cpu");
+  m.def("bf_ctc_forward", &ctc_loss_cpu_template<float, int64_t>, "BF CTC Loss function forward with cpu");
+  m.def("bf_ctc_backward", &ctc_loss_backward_cpu_template<float, int64_t>, "BF CTC Loss function backward with cpu");
 }
 
 
