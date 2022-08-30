@@ -1,8 +1,5 @@
 #include <iostream>
 #include <vector>
-
-
-#include <vector>
 #include <queue>
 #include <memory>
 #include <thread>
@@ -12,12 +9,121 @@
 #include <functional>
 #include <stdexcept>
 #include <numeric>
-
+#include <stdlib.h>
 #include <torch/extension.h>
 
 using Tensor = torch::Tensor;
 using ScalarType = torch::ScalarType;
 using IntArrayRef = torch::IntArrayRef;
+
+
+class ThreadPool {
+public:
+    ThreadPool(size_t);
+    template<class F, class... Args>
+    auto enqueue(F&& f, Args&&... args) 
+        -> std::future<typename std::result_of<F(Args...)>::type>;
+    ~ThreadPool();
+private:
+    // need to keep track of threads so we can join them
+    std::vector< std::thread > workers;
+    // the task queue
+    std::queue< std::function<void()> > tasks;
+    
+    // synchronization
+    std::mutex queue_mutex;
+    std::condition_variable condition;
+    bool stop;
+};
+ 
+// the constructor just launches some amount of workers
+inline ThreadPool::ThreadPool(size_t threads)
+    :   stop(false)
+{
+    for(size_t i = 0;i<threads;++i)
+        workers.emplace_back(
+            [this]
+            {
+                for(;;)
+                {
+                    std::function<void()> task;
+
+                    {
+                        std::unique_lock<std::mutex> lock(this->queue_mutex);
+                        this->condition.wait(lock,
+                            [this]{ return this->stop || !this->tasks.empty(); });
+                        if(this->stop && this->tasks.empty())
+                            return;
+                        task = std::move(this->tasks.front());
+                        this->tasks.pop();
+                    }
+
+                    task();
+                }
+            }
+        );
+}
+
+// add new work item to the pool
+template<class F, class... Args>
+auto ThreadPool::enqueue(F&& f, Args&&... args) 
+    -> std::future<typename std::result_of<F(Args...)>::type>
+{
+    using return_type = typename std::result_of<F(Args...)>::type;
+
+    auto task = std::make_shared< std::packaged_task<return_type()> >(
+            std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+        );
+        
+    std::future<return_type> res = task->get_future();
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+
+        // don't allow enqueueing after stopping the pool
+        if(stop)
+            throw std::runtime_error("enqueue on stopped ThreadPool");
+
+        tasks.emplace([task](){ (*task)(); });
+    }
+    condition.notify_one();
+    return res;
+}
+
+// the destructor joins all threads
+inline ThreadPool::~ThreadPool()
+{
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        stop = true;
+    }
+    condition.notify_all();
+    for(std::thread &worker: workers)
+        worker.join();
+}
+
+
+
+std::shared_ptr<ThreadPool> get_thread_pool(){
+  static std::shared_ptr<ThreadPool> thread_pool = NULL;
+  static std::mutex mtx;
+  std::lock_guard<std::mutex> lock(mtx);
+  if (thread_pool != NULL) return thread_pool;
+  char* thread_num_str = getenv("BFCTC_THREAD_NUM");
+  int thread_num;
+  if (thread_num_str){
+    std::string __(thread_num_str);
+    std::stringstream ss(__);
+    ss >> thread_num;
+  }
+  else{
+    thread_num = 8; //default
+  }
+
+  std::cout<<"bfctc thread number is: "<<thread_num<<"\n";
+  thread_pool = std::make_shared<ThreadPool>(thread_num);
+  return thread_pool;
+}
+
 
 // this ad-hoc converts from targets (l in [1]) to augmented targets (l' in [1]) note that no bound-checking is done
 template<typename target_t>
@@ -34,7 +140,7 @@ static inline int64_t get_target_prime(target_t* target, int64_t offset, int64_t
 // targets [int64]: batch_size x target_length OR sum(target_lengths)
 template<typename scalar_t, typename target_t>
 std::tuple<Tensor, Tensor> ctc_loss_cpu_template(const Tensor& log_probs, const Tensor& targets, IntArrayRef input_lengths, IntArrayRef target_lengths) {
-
+  auto thread_pool = get_thread_pool();
   constexpr scalar_t neginf = -std::numeric_limits<scalar_t>::infinity();
   int64_t batch_size = log_probs.size(1);
 
@@ -77,7 +183,7 @@ std::tuple<Tensor, Tensor> ctc_loss_cpu_template(const Tensor& log_probs, const 
   log_alpha.narrow(1, 0, 1).fill_(neginf);
 
 
-  auto process = [&](int64_t b) {
+  auto process = [&](int64_t b)->int{
         int64_t input_length = input_lengths[b];
         int64_t target_length = target_lengths[b];
         auto log_probs_a = log_probs_a_global[b];
@@ -115,15 +221,16 @@ std::tuple<Tensor, Tensor> ctc_loss_cpu_template(const Tensor& log_probs, const 
         }
 
         neg_log_likelihood_a[b] = -log_alpha_a[input_length-1][target_length-1];
+        return 0;
   };
 
-  std::vector<std::unique_ptr<std::thread>> threads;
-  threads.resize(batch_size);
+  std::queue<std::future<int>> results;
   for (int64_t batch_idx=0; batch_idx<batch_size; batch_idx++){
-    threads[batch_idx].reset(new std::thread(process, batch_idx));
+    results.push(thread_pool->enqueue(process, batch_idx));
   }
-  for (int batch_idx=0; batch_idx<batch_size; batch_idx++){ //sychronize
-    threads[batch_idx]->join();
+  while (results.size() > 0) {//sychronize
+    results.front().get();
+    results.pop();
   }
 
   return std::make_tuple(neg_log_likelihood, log_alpha);
@@ -136,6 +243,7 @@ std::tuple<Tensor, Tensor> ctc_loss_cpu_template(const Tensor& log_probs, const 
 template<typename scalar_t, typename target_t>
 std::tuple<Tensor, Tensor>  ctc_loss_backward_cpu_template(const Tensor& grad_out, const Tensor& log_probs, const Tensor& targets, IntArrayRef input_lengths, IntArrayRef target_lengths,
                                       const Tensor& neg_log_likelihood, const Tensor& log_alpha, bool zero_infinity=true) {
+  auto thread_pool = get_thread_pool();
   constexpr scalar_t neginf = -std::numeric_limits<scalar_t>::infinity();
   int64_t max_input_length = log_probs.size(0);
   int64_t batch_size = log_probs.size(1);
@@ -181,7 +289,7 @@ std::tuple<Tensor, Tensor>  ctc_loss_backward_cpu_template(const Tensor& grad_ou
     scalar_t nll = neg_log_likelihood.accessor<scalar_t, 1>()[b];
     if (zero_infinity &&  nll == std::numeric_limits<scalar_t>::infinity()) {
         grad.narrow(1, b, 1).zero_();
-        return;
+        return 0;
     }
 
     auto log_probs_a = log_probs_a_global[b];
@@ -255,15 +363,16 @@ std::tuple<Tensor, Tensor>  ctc_loss_backward_cpu_template(const Tensor& grad_ou
     if (input_length < max_input_length) {
       grad.narrow(0, input_length, max_input_length - input_length).narrow(1, b, 1).zero_();
     }
+    return 0;
   };
   
-  std::vector<std::unique_ptr<std::thread>> threads;
-  threads.resize(batch_size);
+  std::queue<std::future<int>> results;
   for (int64_t batch_idx=0; batch_idx<batch_size; batch_idx++){
-    threads[batch_idx].reset(new std::thread(process, batch_idx));
+    results.push(thread_pool->enqueue(process, batch_idx));
   }
-  for (int batch_idx=0; batch_idx<batch_size; batch_idx++){ //sychronize
-    threads[batch_idx]->join();
+  while (results.size() > 0) {//sychronize
+    results.front().get();
+    results.pop();
   }
 
   return std::make_tuple(grad, log_beta);
