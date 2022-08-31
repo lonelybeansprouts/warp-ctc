@@ -183,12 +183,17 @@ std::tuple<Tensor, Tensor> ctc_loss_cpu_template(const Tensor& log_probs, const 
   log_alpha.narrow(1, 0, 1).fill_(neginf);
 
 
-  auto process = [&](int64_t b)->int{
+  auto process = [&](int64_t b)->long{
         int64_t input_length = input_lengths[b];
         int64_t target_length = target_lengths[b];
         auto log_probs_a = log_probs_a_global[b];
         auto log_alpha_a = log_alpha_a_global[b];
         int64_t tg_batch_offset = tg_batch_offsets[b];
+
+        if (input_length<target_length){
+          neg_log_likelihood_a[b] = std::numeric_limits<scalar_t>::infinity();
+          return b;
+        }
 
         // the first two items of alpha_t above eq (6)
         log_alpha_a[0][0] = log_probs_a[0][get_target_prime(targets_data, tg_batch_offset, tg_target_stride, 0)];
@@ -221,10 +226,10 @@ std::tuple<Tensor, Tensor> ctc_loss_cpu_template(const Tensor& log_probs, const 
         }
 
         neg_log_likelihood_a[b] = -log_alpha_a[input_length-1][target_length-1];
-        return 0;
+        return b;
   };
 
-  std::queue<std::future<int>> results;
+  std::queue<std::future<long>> results;
   for (int64_t batch_idx=0; batch_idx<batch_size; batch_idx++){
     results.push(thread_pool->enqueue(process, batch_idx));
   }
@@ -285,11 +290,11 @@ std::tuple<Tensor, Tensor>  ctc_loss_backward_cpu_template(const Tensor& grad_ou
   auto grad_a_global = gp.accessor<scalar_t, 3>();
   auto targets_data = targets.data_ptr<target_t>();
 
-  auto process = [&](int64_t b){
+  auto process = [&](int64_t b)->long{
     scalar_t nll = neg_log_likelihood.accessor<scalar_t, 1>()[b];
     if (zero_infinity &&  nll == std::numeric_limits<scalar_t>::infinity()) {
         grad.narrow(1, b, 1).zero_();
-        return 0;
+        return b;
     }
 
     auto log_probs_a = log_probs_a_global[b];
@@ -363,10 +368,10 @@ std::tuple<Tensor, Tensor>  ctc_loss_backward_cpu_template(const Tensor& grad_ou
     if (input_length < max_input_length) {
       grad.narrow(0, input_length, max_input_length - input_length).narrow(1, b, 1).zero_();
     }
-    return 0;
+    return b;
   };
   
-  std::queue<std::future<int>> results;
+  std::queue<std::future<long>> results;
   for (int64_t batch_idx=0; batch_idx<batch_size; batch_idx++){
     results.push(thread_pool->enqueue(process, batch_idx));
   }
