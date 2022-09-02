@@ -192,6 +192,7 @@ std::tuple<Tensor, Tensor> ctc_loss_cpu_template(const Tensor& log_probs, const 
 
         if (input_length<target_length){
           neg_log_likelihood_a[b] = std::numeric_limits<scalar_t>::infinity();
+          std::cerr<<"sample idx:"<<b<<" input_length<target_length, ignored !"<<"\n";
           return b;
         }
 

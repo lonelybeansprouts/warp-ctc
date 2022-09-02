@@ -16,7 +16,7 @@ class _BF_CTC(Function):
         grad_out=torch.ones((batch_size,), dtype=torch.float32)
         grads, log_beta = bf_ctc_backward(grad_out, log_probs, labels, list(input_lengths), list(target_lengths), neg_log_likelihood, log_alpha, True)
         ctx.grads = grads
-        neg_log_likelihood.masked_fill(torch.isnan(neg_log_likelihood), 0.0)
+        neg_log_likelihood = neg_log_likelihood.masked_fill(torch.isinf(neg_log_likelihood), 0.0)
         return neg_log_likelihood
 
     @staticmethod
